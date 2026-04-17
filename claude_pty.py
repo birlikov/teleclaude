@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Callable
 
 
 class ClaudeSession:
@@ -33,13 +34,21 @@ class ClaudeSession:
     sess.stop()
     """
 
-    def __init__(self, cwd: str | None = None):
+    def __init__(
+        self,
+        cwd: str | None = None,
+        session_id: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
+        on_stale_resume: Callable[[], None] | None = None,
+    ):
         self.cwd        = cwd
-        self.session_id : str | None = None           # for --resume
+        self.session_id : str | None = session_id     # for --resume
         self.queue      : asyncio.Queue[str | None] = asyncio.Queue()
         self.alive      = True
         self._in        : asyncio.Queue[str] = asyncio.Queue()
         self._loop_task : asyncio.Task | None = None
+        self._on_session_id   = on_session_id
+        self._on_stale_resume = on_stale_resume
 
     # ── public API ─────────────────────────────────────────────────────────
 
@@ -75,16 +84,34 @@ class ClaudeSession:
             await self.queue.put(None)   # signal the Telegram forwarder to stop
 
     async def _run(self, message: str) -> None:
-        """Invoke `claude -p` and stream parsed results into self.queue."""
+        """Invoke `claude -p`.  Auto-falls-back to a fresh session on stale --resume."""
+        resume_id = self.session_id
+        if resume_id:
+            ok = await self._spawn(message, resume_id)
+            if ok:
+                return
+            # Stale session id — notify, clear, and retry fresh
+            await self.queue.put('⚠️  Previous session expired. Starting fresh.\n')
+            self.session_id = None
+            if self._on_stale_resume:
+                try:
+                    self._on_stale_resume()
+                except Exception:
+                    pass
+        await self._spawn(message, None)
+
+    async def _spawn(self, message: str, resume_id: str | None) -> bool:
+        """Run one `claude -p` invocation.  Returns False iff we suspect a stale resume."""
         args = [
             'claude', '-p', message,
             '--output-format', 'stream-json',
             '--verbose',
             '--dangerously-skip-permissions',
         ]
-        if self.session_id:
-            args += ['--resume', self.session_id]
+        if resume_id:
+            args += ['--resume', resume_id]
 
+        got_event = False
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -98,23 +125,31 @@ class ClaudeSession:
                 if not line:
                     continue
                 try:
-                    await self._handle_event(json.loads(line))
+                    event = json.loads(line)
                 except json.JSONDecodeError:
-                    pass   # shouldn't happen in stream-json mode
+                    continue
+                got_event = True
+                await self._handle_event(event)
 
             await proc.wait()
 
             if proc.returncode not in (0, None):
                 err = (await proc.stderr.read()).decode('utf-8', errors='replace').strip()
+                if resume_id and not got_event:
+                    # Resume failed before producing any output — treat as stale id
+                    return False
                 if err:
                     await self.queue.put(f'\n⚠️  {err}\n')
+            return True
 
         except FileNotFoundError:
             await self.queue.put(
                 '⚠️  `claude` command not found.  Is Claude Code installed and on PATH?\n'
             )
+            return True
         except Exception as e:
             await self.queue.put(f'⚠️  Error: {e}\n')
+            return True
 
     async def _handle_event(self, data: dict) -> None:
         """Parse one JSON event and push human-readable text to the queue."""
@@ -122,7 +157,13 @@ class ClaudeSession:
 
         # Always capture the session ID so we can resume the conversation
         if sid := data.get('session_id'):
-            self.session_id = sid
+            if sid != self.session_id:
+                self.session_id = sid
+                if self._on_session_id:
+                    try:
+                        self._on_session_id(sid)
+                    except Exception:
+                        pass
 
         if t == 'assistant':
             for block in data.get('message', {}).get('content', []):
@@ -162,4 +203,10 @@ class ClaudeSession:
         elif t == 'result':
             # Update session_id from the final result message (most reliable)
             if sid := data.get('session_id'):
-                self.session_id = sid
+                if sid != self.session_id:
+                    self.session_id = sid
+                    if self._on_session_id:
+                        try:
+                            self._on_session_id(sid)
+                        except Exception:
+                            pass

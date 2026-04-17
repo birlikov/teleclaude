@@ -3,12 +3,15 @@ bot.py — TeleClaude: Claude Code via Telegram.
 
 Commands
 --------
-  /project [path]        set (or show) working project directory
+  /workspace [path]      set (or show) base directory containing projects
+  /project               pick a project from the workspace (paginated buttons)
+  /project <path>        set (or switch to) a project directory explicitly
   /status                current project + session overview
 
-  /new                   start a Claude Code session inside the project dir
+  /new                   start a *fresh* Claude Code session in the project dir
   /stop                  stop the Claude session
   (plain text)           forwarded to the active Claude session
+                         (auto-resumes today's per-project memory if idle)
 
   /t <cmd>               run any shell command in the project dir (streaming)
   /terminal <cmd>        alias for /t
@@ -36,7 +39,7 @@ import shlex
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -46,6 +49,7 @@ from telegram.ext import (
     filters,
 )
 
+import store
 from claude_pty import ClaudeSession
 from runner import stream_run
 
@@ -62,8 +66,9 @@ ALLOWED: set[int] = (
     {int(x) for x in _raw_ids.split(",") if x.strip()} if _raw_ids else set()
 )
 
-MAX_TG   = 3800   # Telegram message char limit (with headroom)
-IDLE_SEC = 2.5    # seconds of Claude silence → flush buffer
+MAX_TG      = 3800   # Telegram message char limit (with headroom)
+IDLE_SEC    = 2.5    # seconds of Claude silence → flush buffer
+PAGE_SIZE   = 8      # project picker: buttons per page
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -82,6 +87,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ChatState:
     chat_id     : int
+    workspace   : str | None = None                          # abs path to base dir
     project     : str | None = None                          # abs path to project
     claude_sess : ClaudeSession | None = None
     claude_task : asyncio.Task | None  = None
@@ -92,7 +98,11 @@ _states: dict[int, ChatState] = {}
 
 def get_state(chat_id: int) -> ChatState:
     if chat_id not in _states:
-        _states[chat_id] = ChatState(chat_id=chat_id)
+        s = ChatState(chat_id=chat_id)
+        # Rehydrate persisted workspace + project so bot restarts are transparent
+        s.workspace = store.get_workspace(chat_id)
+        s.project   = store.get_current_project(chat_id)
+        _states[chat_id] = s
     return _states[chat_id]
 
 
@@ -211,9 +221,11 @@ async def _run(cmd: str, state: ChatState, update) -> None:
 
 HELP = (
     "<b>TeleClaude</b>\n\n"
-    "<b>Project</b>\n"
-    "  /project &lt;path&gt;       — set working directory\n"
-    "  /project              — show current project\n"
+    "<b>Workspace / Project</b>\n"
+    "  /workspace &lt;path&gt;     — set base dir containing projects\n"
+    "  /workspace            — show current workspace\n"
+    "  /project              — pick a project (paginated buttons)\n"
+    "  /project &lt;path&gt;       — set a project directly\n"
     "  /status               — project + session overview\n\n"
     "<b>Claude Code</b>\n"
     "  /new                  — start Claude session in project dir\n"
@@ -243,31 +255,30 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /project
+# /workspace
 # ---------------------------------------------------------------------------
 
-async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_workspace(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
     state   = get_state(chat_id)
 
     if not ctx.args:
-        if state.project:
+        if state.workspace:
             await update.message.reply_text(
-                f"Current project:\n<code>{html.escape(state.project)}</code>",
+                f"Workspace:\n<code>{html.escape(state.workspace)}</code>\n\n"
+                "Use /project to pick a subdirectory.",
                 parse_mode="HTML",
             )
         else:
             await update.message.reply_text(
-                "No project set.  Example:\n<code>/project ~/code/my-app</code>",
+                "No workspace set.  Example:\n<code>/workspace ~/Desktop</code>",
                 parse_mode="HTML",
             )
         return
 
-    path = os.path.expanduser(" ".join(ctx.args))
-    path = os.path.abspath(path)
-
+    path = os.path.abspath(os.path.expanduser(" ".join(ctx.args)))
     if not os.path.isdir(path):
         await update.message.reply_text(
             f"Directory not found:\n<code>{html.escape(path)}</code>",
@@ -275,23 +286,191 @@ async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    state.project = path
-
-    # Pull a bit of context to confirm it's a repo
-    proc = await asyncio.create_subprocess_shell(
-        "git remote get-url origin 2>/dev/null; echo '---'; git branch --show-current 2>/dev/null",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        cwd=path,
+    state.workspace = path
+    store.set_workspace(chat_id, path)
+    await update.message.reply_text(
+        f"✅ Workspace set to:\n<code>{html.escape(path)}</code>\n\n"
+        "Use /project to pick a project.",
+        parse_mode="HTML",
     )
-    out, _ = await proc.communicate()
-    info   = out.decode().strip()
 
-    msg = f"✅ Project set to:\n<code>{html.escape(path)}</code>"
-    if info and info != "---":
-        msg += f"\n\n<pre>{html.escape(info)}</pre>"
 
-    await update.message.reply_text(msg, parse_mode="HTML")
+# ---------------------------------------------------------------------------
+# /project  — paginated picker, or explicit path
+# ---------------------------------------------------------------------------
+
+def _list_projects(workspace: str) -> list[str]:
+    try:
+        entries = sorted(os.listdir(workspace))
+    except OSError:
+        return []
+    return [
+        e for e in entries
+        if not e.startswith(".") and os.path.isdir(os.path.join(workspace, e))
+    ]
+
+
+def _project_keyboard(projects: list[str], page: int) -> InlineKeyboardMarkup:
+    pages = max(1, (len(projects) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page  = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    chunk = projects[start:start + PAGE_SIZE]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, name in enumerate(chunk):
+        idx = start + i
+        label = name if len(name) <= 40 else name[:37] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"proj:s:{idx}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("← Prev", callback_data=f"proj:p:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="proj:noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next →", callback_data=f"proj:p:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+async def _switch_project(state: ChatState, ctx: ContextTypes.DEFAULT_TYPE,
+                          path: str, reply_to) -> None:
+    """Kill current session, set new project, auto-spawn Claude (resume today's id or fresh)."""
+    await _kill_claude(state)
+    state.project = path
+    store.set_current_project(state.chat_id, path)
+
+    sid = store.get_today_session(state.chat_id, path)
+    _start_claude(state, ctx, path, sid)
+
+    label = os.path.basename(path) or path
+    mode  = "resumed today's session" if sid else "fresh session"
+    await reply_to.reply_text(
+        f"✅ Project: <code>{html.escape(label)}</code>\n"
+        f"<code>{html.escape(path)}</code>\n\n"
+        f"Claude {mode}.  Send a message.",
+        parse_mode="HTML",
+    )
+
+
+def _start_claude(state: ChatState, ctx: ContextTypes.DEFAULT_TYPE,
+                  path: str, session_id: str | None) -> None:
+    """Spawn a ClaudeSession wired to persist session_id updates for (chat_id, path)."""
+    chat_id = state.chat_id
+    sess = ClaudeSession(
+        cwd=path,
+        session_id=session_id,
+        on_session_id=lambda sid, p=path, cid=chat_id: store.save_session(cid, p, sid),
+        on_stale_resume=lambda p=path, cid=chat_id: store.clear_session(cid, p),
+    )
+    sess.start()
+    state.claude_sess = sess
+    state.claude_task = asyncio.create_task(_forward_claude(state, ctx))
+
+
+async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    state   = get_state(chat_id)
+
+    # Explicit path: /project <path>
+    if ctx.args:
+        path = os.path.abspath(os.path.expanduser(" ".join(ctx.args)))
+        if not os.path.isdir(path):
+            await update.message.reply_text(
+                f"Directory not found:\n<code>{html.escape(path)}</code>",
+                parse_mode="HTML",
+            )
+            return
+        await _switch_project(state, ctx, path, update.message)
+        return
+
+    # No args: paginated picker from workspace
+    if not state.workspace:
+        cur = (
+            f"\n\nCurrent project:\n<code>{html.escape(state.project)}</code>"
+            if state.project else ""
+        )
+        await update.message.reply_text(
+            "No workspace set.  Use <code>/workspace &lt;path&gt;</code> first, "
+            "or <code>/project &lt;path&gt;</code> to set a project directly." + cur,
+            parse_mode="HTML",
+        )
+        return
+
+    projects = _list_projects(state.workspace)
+    if not projects:
+        await update.message.reply_text(
+            f"No subdirectories under workspace:\n<code>{html.escape(state.workspace)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    header = f"Pick a project from <code>{html.escape(state.workspace)}</code>:"
+    if state.project:
+        header += f"\n\nCurrent: <code>{html.escape(os.path.basename(state.project))}</code>"
+    await update.message.reply_text(
+        header,
+        parse_mode="HTML",
+        reply_markup=_project_keyboard(projects, 0),
+    )
+
+
+async def on_project_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-keyboard callback for the /project picker."""
+    query   = update.callback_query
+    chat_id = update.effective_chat.id
+    state   = get_state(chat_id)
+    parts   = (query.data or "").split(":")
+
+    if len(parts) < 2:
+        await query.answer()
+        return
+
+    action = parts[1]
+    if action == "noop":
+        await query.answer()
+        return
+
+    if not state.workspace:
+        await query.answer("No workspace set.")
+        return
+
+    projects = _list_projects(state.workspace)
+
+    if action == "p" and len(parts) >= 3:
+        try:
+            page = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        try:
+            await query.edit_message_reply_markup(_project_keyboard(projects, page))
+        except Exception:
+            pass
+        await query.answer()
+        return
+
+    if action == "s" and len(parts) >= 3:
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        if idx >= len(projects):
+            await query.answer("Project list changed.  /project again.")
+            return
+        name = projects[idx]
+        path = os.path.join(state.workspace, name)
+        await query.answer(f"Switching to {name}…")
+        try:
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        await _switch_project(state, ctx, path, query.message)
+        return
+
+    await query.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -340,14 +519,13 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await _kill_claude(state)
 
-    sess = ClaudeSession(cwd=state.project)
-    sess.start()
-    state.claude_sess = sess
-    state.claude_task = asyncio.create_task(_forward_claude(state, ctx))
+    # /new is explicit reset — always fresh, ignoring any saved session_id.
+    # The new session_id (once assigned) will overwrite today's saved id.
+    _start_claude(state, ctx, state.project, None)
 
     note = f" in <code>{html.escape(state.project)}</code>" if state.project else ""
     await update.message.reply_text(
-        f"Claude session ready{note}.  Send your task.",
+        f"Claude session ready{note} (fresh).  Send your task.",
         parse_mode="HTML",
     )
 
@@ -580,11 +758,24 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update.effective_user.id):
         return
     state = get_state(update.effective_chat.id)
+
+    # Auto-spin a session using today's memory (if any) so switching / restarting
+    # is transparent.  Only /new forces a fresh reset.
     if not state.claude_sess or not state.claude_sess.alive:
-        await update.message.reply_text(
-            "No active Claude session.  Use /new to start one."
-        )
-        return
+        if not state.project:
+            await update.message.reply_text(
+                "No project set.  Use /workspace and /project first."
+            )
+            return
+        if not os.path.isdir(state.project):
+            await update.message.reply_text(
+                f"Project directory no longer exists:\n<code>{html.escape(state.project)}</code>",
+                parse_mode="HTML",
+            )
+            return
+        sid = store.get_today_session(state.chat_id, state.project)
+        _start_claude(state, ctx, state.project, sid)
+
     await state.claude_sess.send(update.message.text)
 
 
@@ -594,7 +785,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _set_commands(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("project", "Set or show working project directory"),
+        BotCommand("workspace", "Set or show workspace base directory"),
+        BotCommand("project", "Pick a project (or set one directly)"),
         BotCommand("status",  "Project, branch & session overview"),
         BotCommand("new",     "Start Claude Code session in project dir"),
         BotCommand("stop",    "Stop Claude session"),
@@ -612,6 +804,7 @@ def main() -> None:
     app = Application.builder().token(TOKEN).post_init(_set_commands).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
+    app.add_handler(CommandHandler("workspace",       cmd_workspace))
     app.add_handler(CommandHandler("project",         cmd_project))
     app.add_handler(CommandHandler("status",          cmd_status))
     app.add_handler(CommandHandler("new",             cmd_new))
@@ -623,7 +816,8 @@ def main() -> None:
     app.add_handler(CommandHandler("docker",          cmd_docker))
     app.add_handler(CommandHandler(["mr", "pr"],      cmd_mr))
 
-    app.add_handler(CallbackQueryHandler(on_cancel_button, pattern=r"^cancel:"))
+    app.add_handler(CallbackQueryHandler(on_cancel_button,  pattern=r"^cancel:"))
+    app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^proj:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("TeleClaude bot started.")

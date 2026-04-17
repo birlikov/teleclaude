@@ -41,10 +41,12 @@ python bot.py
 
 | Command | Description |
 |---|---|
-| `/project <path>` | Set working project directory |
-| `/project` | Show current project |
+| `/workspace <path>` | Set base directory containing projects |
+| `/workspace` | Show current workspace |
+| `/project` | Pick a project from the workspace (paginated buttons) |
+| `/project <path>` | Set/switch to a project directly |
 | `/status` | Project, branch, session & command status |
-| `/new` | Start a Claude Code session |
+| `/new` | Start a *fresh* Claude Code session |
 | `/stop` | Stop the Claude session |
 | *(plain text)* | Forwarded to active Claude session |
 | `/t <cmd>` | Run a shell command (streaming output) |
@@ -60,7 +62,15 @@ python bot.py
 bot.py          Telegram handlers, per-chat state, message routing
 claude_pty.py   Claude Code session manager (subprocess + stream-json parsing)
 runner.py       Async shell runner with live message updates and cancel support
+store.py        JSON-backed state: workspace, current project, per-project session ids
 ```
+
+### Per-project daily memory
+
+Switching projects (via `/project` picker or `/project <path>`) resumes that
+project's Claude conversation **only if it was last used today** — otherwise
+a fresh session is started.  `/new` always starts fresh, regardless of saved
+state.  Session ids are persisted per `(chat, project)` in `state.json`.
 
 ## License
 
