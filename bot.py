@@ -126,12 +126,28 @@ async def _kill_claude(state: ChatState) -> None:
         state.claude_sess = None
 
 
+def _fmt_chunk(kind: str, content: str) -> str:
+    """Render one tagged Claude chunk to a self-contained HTML fragment."""
+    if kind == "text":
+        return html.escape(content) + "\n\n"
+    if kind == "tool":
+        return f"🔧 <code>{html.escape(content)}</code>\n"
+    if kind == "result":
+        return f"<pre>{html.escape(content)}</pre>\n"
+    if kind == "notice":
+        return f"<i>{html.escape(content)}</i>\n"
+    return html.escape(content) + "\n"
+
+
 async def _forward_claude(state: ChatState, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Background task: drain session.queue and relay content to Telegram.
-    While Claude is streaming output, keep editing a single "live" message.
-    After IDLE_SEC seconds of silence, finalise and reset — Claude is waiting
-    for input.
+
+    Each queue item is a (kind, content) tuple — 'text' renders as plain
+    Telegram text; 'tool', 'result', and 'notice' render as code/italic
+    blocks. Assistant prose and tool output live side-by-side in the same
+    message, with live editing while Claude is streaming and a flush after
+    IDLE_SEC of silence.
     """
     session = state.claude_sess
     chat_id = state.chat_id
@@ -139,54 +155,86 @@ async def _forward_claude(state: ChatState, context: ContextTypes.DEFAULT_TYPE) 
 
     from telegram.error import BadRequest
 
-    live = None
-    buf  = ""
+    live = None          # current Telegram Message being edited (or None)
+    live_html = ""       # HTML currently displayed in `live`
+    pending: list[str] = []   # HTML fragments not yet flushed/edited in
 
-    async def flush():
-        nonlocal live, buf
-        text = buf.strip()
-        buf  = ""
-        if not text:
+    async def _send(text: str):
+        return await bot.send_message(chat_id, text, parse_mode="HTML")
+
+    async def _edit_or_send(msg, text: str):
+        try:
+            await msg.edit_text(text, parse_mode="HTML")
+            return msg
+        except BadRequest:
+            return await _send(text)
+
+    async def refresh():
+        """Show everything in `pending` — edit `live` if it still fits, else split at fragment boundaries."""
+        nonlocal live, live_html, pending
+        if not pending:
             return
-        while text:
-            piece   = text[:MAX_TG]
-            text    = text[MAX_TG:]
-            escaped = html.escape(piece)
-            tg_text = f"<pre>{escaped}</pre>"
+
+        combined = live_html + "".join(pending)
+        # Simple case: everything fits into the current live message.
+        if len(combined) <= MAX_TG:
             if live is None:
-                live = await bot.send_message(chat_id, tg_text, parse_mode="HTML")
+                live = await _send(combined)
             else:
-                try:
-                    await live.edit_text(tg_text, parse_mode="HTML")
-                except BadRequest:
-                    live = await bot.send_message(chat_id, tg_text, parse_mode="HTML")
-            if text:
-                live = None   # next piece needs a new message
+                live = await _edit_or_send(live, combined)
+            live_html = combined
+            pending = []
+            return
+
+        # Overflow: pack fragments into MAX_TG-sized groups, starting with
+        # whatever is already shown in `live` (we can't un-send those bytes,
+        # so they anchor the first group even if it means the first group
+        # stays larger than strictly needed).
+        groups: list[str] = []
+        cur = live_html
+        for frag in pending:
+            if cur and len(cur) + len(frag) > MAX_TG:
+                groups.append(cur)
+                cur = frag
+            else:
+                cur += frag
+        if cur:
+            groups.append(cur)
+
+        # First group: edit/send into `live`. Subsequent groups: new messages.
+        for i, g in enumerate(groups):
+            if i == 0:
+                if live is None:
+                    live = await _send(g)
+                else:
+                    live = await _edit_or_send(live, g)
+            else:
+                live = await _send(g)
+        live_html = groups[-1]
+        pending = []
 
     try:
         while True:
             try:
-                chunk = await asyncio.wait_for(session.queue.get(), timeout=IDLE_SEC)
+                item = await asyncio.wait_for(session.queue.get(), timeout=IDLE_SEC)
             except asyncio.TimeoutError:
-                await flush()
-                live = None   # next burst → fresh message
+                await refresh()
+                # Idle: next burst starts a fresh message.
+                live = None
+                live_html = ""
                 continue
 
-            if chunk is None:           # sentinel: session ended / process exited
-                await flush()
-                await bot.send_message(
-                    chat_id,
-                    "<i>Claude session ended.  /new to start again.</i>",
-                    parse_mode="HTML",
-                )
+            if item is None:           # sentinel: session ended / process exited
+                await refresh()
+                await _send("<i>Claude session ended.  /new to start again.</i>")
                 state.claude_sess = None
                 state.claude_task = None
                 return
 
-            buf += chunk
-            if len(buf) >= MAX_TG:
-                await flush()
-                live = None
+            kind, content = item
+            pending.append(_fmt_chunk(kind, content))
+            if len(live_html) + sum(len(p) for p in pending) >= MAX_TG:
+                await refresh()
 
     except asyncio.CancelledError:
         pass

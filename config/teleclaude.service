@@ -1,0 +1,33 @@
+[Unit]
+Description=TeleClaude — Claude Code via Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Absolute path to your cloned repo.
+WorkingDirectory=/PATH/TO/teleclaude
+
+# Loads TELEGRAM_BOT_TOKEN / ALLOWED_USER_IDS.
+# (bot.py also calls load_dotenv(), so either path works.)
+EnvironmentFile=/PATH/TO/teleclaude/.env
+
+# systemd does NOT inherit your shell PATH, so extend it to reach:
+#   - the `claude` CLI (usually under nvm)
+#   - the Python interpreter with python-telegram-bot installed
+# Adjust both entries for your install.
+Environment=PATH=/PATH/TO/node/bin:/PATH/TO/python-venv/bin:/usr/local/bin:/usr/bin:/bin
+
+# Absolute path to the Python interpreter that has python-telegram-bot
+# and python-dotenv installed (venv, conda env, or system python).
+ExecStart=/PATH/TO/python /PATH/TO/teleclaude/bot.py
+
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=teleclaude
+
+[Install]
+WantedBy=default.target

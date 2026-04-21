@@ -16,14 +16,23 @@ import asyncio
 import json
 from typing import Callable
 
+# Forwarder-facing chunk: (kind, content) where kind ∈ {'text', 'tool', 'result', 'notice'}.
+Chunk = tuple[str, str]
+
+# StreamReader buffer for Claude's NDJSON output. A single tool_result or large
+# assistant message can easily exceed the default 64 KiB — raising
+# LimitOverrunError ("Separator is found, but chunk is longer than limit")
+# and silently dropping the rest of the session's output.
+_STREAM_LIMIT = 64 * 1024 * 1024   # 64 MiB
+
 
 class ClaudeSession:
     """
     Manages Claude Code interaction via subprocess (print mode).
 
-    User messages are queued and processed one at a time.  Text chunks,
-    tool notifications, and errors are pushed to self.queue for the
-    Telegram bot to consume.
+    User messages are queued and processed one at a time.  Tagged chunks
+    (text / tool / result / notice) are pushed to self.queue for the
+    Telegram bot to format.
 
     Usage
     -----
@@ -43,7 +52,7 @@ class ClaudeSession:
     ):
         self.cwd        = cwd
         self.session_id : str | None = session_id     # for --resume
-        self.queue      : asyncio.Queue[str | None] = asyncio.Queue()
+        self.queue      : asyncio.Queue[Chunk | None] = asyncio.Queue()
         self.alive      = True
         self._in        : asyncio.Queue[str] = asyncio.Queue()
         self._loop_task : asyncio.Task | None = None
@@ -91,7 +100,7 @@ class ClaudeSession:
             if ok:
                 return
             # Stale session id — notify, clear, and retry fresh
-            await self.queue.put('⚠️  Previous session expired. Starting fresh.\n')
+            await self.queue.put(('notice', '⚠️  Previous session expired. Starting fresh.'))
             self.session_id = None
             if self._on_stale_resume:
                 try:
@@ -99,6 +108,36 @@ class ClaudeSession:
                 except Exception:
                     pass
         await self._spawn(message, None)
+
+    async def _read_lines(self, stream: asyncio.StreamReader):
+        """Yield decoded, non-empty lines, tolerating oversized lines gracefully.
+
+        The default StreamReader limit (64 KiB) trips on large tool_result or
+        assistant text events. We raise the limit at creation, but also handle
+        LimitOverrunError defensively so one pathological line never kills the
+        rest of the stream.
+        """
+        while True:
+            try:
+                raw = await stream.readline()
+            except asyncio.LimitOverrunError as e:
+                # Drain the oversized line and skip it.
+                try:
+                    await stream.readexactly(e.consumed)
+                except (asyncio.IncompleteReadError, Exception):
+                    pass
+                await self.queue.put((
+                    'notice',
+                    '⚠️  Skipped an oversized event from Claude (line too long to parse).',
+                ))
+                continue
+            except Exception:
+                return
+            if not raw:
+                return
+            line = raw.decode('utf-8', errors='replace').strip()
+            if line:
+                yield line
 
     async def _spawn(self, message: str, resume_id: str | None) -> bool:
         """Run one `claude -p` invocation.  Returns False iff we suspect a stale resume."""
@@ -118,12 +157,10 @@ class ClaudeSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
+                limit=_STREAM_LIMIT,
             )
 
-            async for raw in proc.stdout:
-                line = raw.decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
+            async for line in self._read_lines(proc.stdout):
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
@@ -139,16 +176,17 @@ class ClaudeSession:
                     # Resume failed before producing any output — treat as stale id
                     return False
                 if err:
-                    await self.queue.put(f'\n⚠️  {err}\n')
+                    await self.queue.put(('notice', f'⚠️  {err}'))
             return True
 
         except FileNotFoundError:
-            await self.queue.put(
-                '⚠️  `claude` command not found.  Is Claude Code installed and on PATH?\n'
-            )
+            await self.queue.put((
+                'notice',
+                '⚠️  `claude` command not found.  Is Claude Code installed and on PATH?',
+            ))
             return True
         except Exception as e:
-            await self.queue.put(f'⚠️  Error: {e}\n')
+            await self.queue.put(('notice', f'⚠️  Error: {e}'))
             return True
 
     async def _handle_event(self, data: dict) -> None:
@@ -172,7 +210,7 @@ class ClaudeSession:
                 if btype == 'text':
                     text = block.get('text', '').strip()
                     if text:
-                        await self.queue.put(text + '\n')
+                        await self.queue.put(('text', text))
 
                 elif btype == 'tool_use':
                     # Narrate what Claude is about to do
@@ -184,7 +222,7 @@ class ClaudeSession:
                         summary = f'{name}: {inp["file_path"]}'
                     else:
                         summary = name
-                    await self.queue.put(f'🔧 `{summary}`\n')
+                    await self.queue.put(('tool', summary))
 
         elif t == 'tool_result':
             # Show tool output (truncated if long)
@@ -195,10 +233,10 @@ class ClaudeSession:
                         text = c.get('text', '').strip()
                         if text:
                             snippet = text[:800] + ('…' if len(text) > 800 else '')
-                            await self.queue.put(f'```\n{snippet}\n```\n')
+                            await self.queue.put(('result', snippet))
             elif isinstance(content, str) and content.strip():
                 snippet = content.strip()[:800]
-                await self.queue.put(f'```\n{snippet}\n```\n')
+                await self.queue.put(('result', snippet))
 
         elif t == 'result':
             # Update session_id from the final result message (most reliable)
